@@ -1,0 +1,62 @@
+# 每次推送到 main，自動打包 Mac 版與 Windows 版，並各跑一次冒煙測試。
+# 打包結果在 GitHub 的 Actions 頁面 → 該次執行 → Artifacts 下載。
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  mac:
+    runs-on: macos-latest   # Apple Silicon（M1 之後的 Mac）
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安裝套件
+        run: pip install opencv-python numpy pillow pyinstaller
+      - name: 打包 .app
+        run: pyinstaller --noconfirm pindou_mac.spec
+      - name: 冒煙測試（不開視窗，輸出一張圖）
+        run: |
+          python tests/make_sample.py sample.png
+          ./dist/PindouMirror.app/Contents/MacOS/PindouMirror --demo sample.png --snapshot snap_mac.png --screen 1080x1920 --nohelp
+          test -s snap_mac.png
+          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" dist/PindouMirror.app/Contents/Info.plist
+      - name: 壓縮（ditto 才能保留 .app 結構與簽章）
+        run: ditto -c -k --keepParent dist/PindouMirror.app PindouMirror-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PindouMirror-mac
+          path: |
+            PindouMirror-mac.zip
+            README.txt
+            snap_mac.png
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安裝套件
+        run: pip install opencv-python numpy pillow pyinstaller
+      - name: 打包 exe
+        run: pyinstaller --noconfirm --onefile --noconsole --name PindouMirror --add-data "palettes;palettes" --exclude-module tkinter --exclude-module matplotlib pindou_mirror.py
+      - name: 冒煙測試
+        shell: pwsh
+        run: |
+          python tests/make_sample.py sample.png
+          $p = Start-Process dist\PindouMirror.exe -ArgumentList "--demo sample.png --snapshot snap_win.png --screen 1080x1920 --nohelp" -PassThru
+          if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; throw "timeout" }
+          if (-not (Test-Path snap_win.png)) { if (Test-Path dist\pindou_error.log) { Get-Content dist\pindou_error.log }; throw "no snapshot" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PindouMirror-windows
+          path: |
+            dist/PindouMirror.exe
+            README.txt
+            snap_win.png

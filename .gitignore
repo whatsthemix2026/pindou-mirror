@@ -1,0 +1,11 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+pindou_settings.json
+pindou_error.log
+sample.png
+snap_*.png
+# PyInstaller 本機自動產生（含本機絕對路徑）
+拼豆鏡子.spec
