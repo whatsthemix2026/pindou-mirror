@@ -9,7 +9,18 @@ on:
 
 jobs:
   mac:
-    runs-on: macos-latest   # Apple Silicon（M1 之後的 Mac）
+    # arm64：Apple 晶片（M1 之後）原生執行；intel：Intel Mac 原生，Apple 晶片的 Mac 也能透過 Rosetta 執行。
+    # GitHub 的 arm64 Mac 機器常常排隊排很久，兩種同時打包，哪個先好就先用。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,12 +37,12 @@ jobs:
           test -s snap_mac.png
           /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" dist/PindouMirror.app/Contents/Info.plist
       - name: 壓縮（ditto 才能保留 .app 結構與簽章）
-        run: ditto -c -k --keepParent dist/PindouMirror.app PindouMirror-mac.zip
+        run: ditto -c -k --keepParent dist/PindouMirror.app PindouMirror-mac-${{ matrix.arch }}.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: PindouMirror-mac
+          name: PindouMirror-mac-${{ matrix.arch }}
           path: |
-            PindouMirror-mac.zip
+            PindouMirror-mac-${{ matrix.arch }}.zip
             README.txt
             snap_mac.png
 
