@@ -100,7 +100,7 @@ def build_lut(rgb):
 
 # ---------- 豆子外觀 ----------
 
-BOARD = np.array([226, 230, 234], np.uint8)  # 豆子之間的空隙（模板底色），BGR
+BOARD = np.array([10, 10, 10], np.uint8)  # 豆子之間的空隙（模板底色），BGR；黑底
 
 def make_sprites(rgb, size):
     """每個顏色預先畫好一顆豆：圓柱外圈、中間孔洞、左上亮面、右下陰影"""
