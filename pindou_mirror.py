@@ -9,7 +9,12 @@
   C         切換攝影機
   F         全螢幕開關
   L         自動補光開關（展場偏暗時讓顏色不灰）
+  N / P     下一個 / 上一個濾鏡
+  A         濾鏡自動輪播開關（預設每 15 秒換一個）
   H         顯示 / 隱藏操作說明
+
+濾鏡：原色、黑白、粉彩、霓虹、五種人格色。每個濾鏡都只用真實拼豆色號中的一組，
+畫面永遠是「真的拼得出來」的拼豆圖。人格色取自五隻像素角色 GIF 的主要顏色。
 
 測試用：pindou_mirror.exe --demo 影片或圖片路徑（沒有攝影機時用影片代替）
 
@@ -52,7 +57,9 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 SETTINGS = os.path.join(app_dir(), "pindou_settings.json")
-DEFAULTS = {"cols": 48, "brand": 0, "mirror": True, "rotate": 0, "camera": 0, "fullscreen": True, "boost": True}
+DEFAULTS = {"cols": 40, "brand": 0, "mirror": True, "rotate": 0, "camera": 0, "fullscreen": True, "boost": True,
+            "filter": 0, "auto": True}
+AUTO_SECONDS = 15
 
 def load_settings():
     s = dict(DEFAULTS)
@@ -97,6 +104,102 @@ def build_lut(rgb):
         d = ((grid_lab[i:i + 4096, None, :] - pal_lab[None, :, :]) ** 2).sum(-1)
         lut[i:i + 4096] = d.argmin(1)
     return lut.reshape(32, 32, 32)
+
+# ---------- 濾鏡（每個濾鏡＝一組真實色號） ----------
+
+PERSONA_ORDER = ["G", "F", "R", "E", "H"]
+
+def load_personas():
+    try:
+        with open(os.path.join(res_dir(), "palettes", "personas.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return [(d[t]["name"], d[t]["colors"]) for t in PERSONA_ORDER if t in d]
+    except (OSError, ValueError, KeyError):
+        return []
+
+def filter_names(personas):
+    return ["原色", "黑白", "粉彩", "霓虹"] + [n for n, _ in personas]
+
+def filter_subset(rgb, fi, personas):
+    """回傳這個濾鏡可用的色號索引（指向完整色表）"""
+    lab = cv2.cvtColor(rgb.reshape(1, -1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    L = lab[:, 0] * 100 / 255
+    C = np.hypot(lab[:, 1] - 128, lab[:, 2] - 128)
+    hsv = cv2.cvtColor(rgb.reshape(1, -1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3).astype(np.float32) / 255
+    darkest = int(L.argmin())
+    if fi == 0:                                   # 原色
+        sub = np.arange(len(rgb))
+    elif fi == 1:                                 # 黑白：幾乎沒有彩度的豆子
+        sub = np.where(C < 9)[0]
+    elif fi == 2:                                 # 粉彩：亮、彩度中低
+        sub = np.where((L > 68) & (C > 8) & (C < 48))[0]
+    elif fi == 3:                                 # 霓虹：高飽和高亮度，加最黑的豆讓暗部是黑的
+        sub = np.append(np.where((hsv[:, 1] > 0.6) & (hsv[:, 2] > 0.8))[0], darkest)
+    else:                                         # 人格色：角色主要顏色對應到最接近的豆子
+        anchors = np.array(personas[fi - 4][1], np.uint8).reshape(1, -1, 3)
+        a_lab = cv2.cvtColor(anchors, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+        sub = ((a_lab[:, None, :] - lab[None, :, :]) ** 2).sum(-1).argmin(1)
+        if L[sub].min() > 30:                     # 沒有深色就補一顆最黑的，暗部才有層次
+            sub = np.append(sub, darkest)
+    sub = np.unique(sub)
+    return sub if len(sub) >= 2 else np.arange(len(rgb))
+
+# ---------- 外框 ----------
+
+FRAME_FILE = os.path.join("assets", "frame.gif")
+
+def load_frame():
+    """外框 GIF：自動找出中間透明窗格的位置，之後換別張外框也不用改程式"""
+    p = os.path.join(res_dir(), FRAME_FILE)
+    if not os.path.exists(p):
+        return None
+    from PIL import Image, ImageSequence
+    im = Image.open(p)
+    frames, durs = [], []
+    for f in ImageSequence.Iterator(im):
+        a = np.array(f.convert("RGBA"))
+        frames.append(a[..., [2, 1, 0, 3]].copy())  # RGBA → BGRA
+        durs.append(f.info.get("duration") or 100)
+    al = frames[0][..., 3]
+    H, W = al.shape
+    ys = np.where(al[:, W // 2] < 10)[0]
+    xs = np.where(al[H // 3, :] < 10)[0]
+    win = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1) if len(xs) and len(ys) else (0, 0, W, H)
+    border = tuple(int(v) for v in frames[0][min(20, H - 1), min(20, W - 1), :3])
+    return {"frames": frames, "durs": durs, "total": sum(durs), "win": win, "size": (W, H), "border": border}
+
+_frame_cache = {}
+
+def scaled_frames(fr, fw, fh):
+    """外框縮放後的 (BGR, 不透明遮罩) 清單；像素圖用最近鄰縮放保持銳利"""
+    key = (fw, fh)
+    if key not in _frame_cache:
+        _frame_cache.clear()
+        out = []
+        for f in fr["frames"]:
+            r = cv2.resize(f, (fw, fh), interpolation=cv2.INTER_NEAREST)
+            out.append((r[..., :3].copy(), r[..., 3] > 127))
+        _frame_cache[key] = out
+    return _frame_cache[key]
+
+_label_cache = {}
+
+def label_image(text, height, bg, fg=(255, 255, 255)):
+    """預先畫好的小標籤（避免每一格都用 Pillow 重畫整個畫面）"""
+    key = (text, height, bg)
+    if key not in _label_cache:
+        from PIL import Image, ImageDraw, ImageFont
+        font_path = next((p for p in FONT_CANDIDATES if os.path.exists(p)), None)
+        size = max(12, int(height * 0.6))
+        font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+        tmp = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        w = int(tmp.textlength(text, font=font)) + height
+        img = Image.new("RGB", (w, height), bg[::-1])
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((0, 0, w - 1, height - 1), radius=height // 2, fill=(16, 36, 58))
+        d.text((height // 2, (height - size) // 2 - size // 10), text, font=font, fill=fg)
+        _label_cache[key] = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    return _label_cache[key]
 
 # ---------- 豆子外觀 ----------
 
@@ -230,13 +333,26 @@ def main():
     s = load_settings()
     if snapshot:
         s["fullscreen"] = True
-    palettes = {}
+        s["auto"] = False
+    if arg("--filter") is not None:
+        s["filter"] = int(arg("--filter"))
+    personas = load_personas()
+    fnames = filter_names(personas)
+    s["filter"] = int(s["filter"]) % len(fnames)
+    frame_data = load_frame()
+    palettes, luts = {}, {}
 
     def palette(i):
         if i not in palettes:
-            codes, rgb = load_palette(BRANDS[i][1])
-            palettes[i] = (codes, rgb, build_lut(rgb))
+            palettes[i] = load_palette(BRANDS[i][1])
         return palettes[i]
+
+    def lut_for(bi, fi):
+        if (bi, fi) not in luts:
+            _, rgb = palette(bi)
+            sub = filter_subset(rgb, fi, personas)
+            luts[(bi, fi)] = (sub[build_lut(rgb[sub])], len(sub))
+        return luts[(bi, fi)]
 
     sw, sh = screen_size()
     if screen_arg:
@@ -272,6 +388,7 @@ def main():
     last_cols = None
     frames_done = 0
     last_retry = time.time()
+    last_switch = time.time()
 
     while True:
         # 取畫面
@@ -283,22 +400,43 @@ def main():
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
 
-        # 依螢幕方向決定輸出畫布（螢幕直放就滿版，橫放就置中一個直立畫面）
+        # 濾鏡自動輪播
+        if s["auto"] and time.time() - last_switch >= AUTO_SECONDS:
+            s["filter"] = (s["filter"] + 1) % len(fnames)
+            last_switch = time.time()
+
+        # ---- 版面：輸出畫面 → 外框（9:16，等比放進畫面）→ 外框中間的窗格放拼豆 ----
         rot = s["rotate"] % 4
-        out_w, out_h = (sh, sw) if rot % 2 else (sw, sh)
         if s["fullscreen"]:
-            canvas_h = out_h
-            # 直放的螢幕整個填滿；橫放（測試用筆電）就在中間放一個 9:16 直立畫面
-            canvas_w = out_w if out_h >= out_w else int(out_h / ASPECT)
+            out_w, out_h = (sh, sw) if rot % 2 else (sw, sh)
         else:
-            canvas_h = int(sh * 0.85)
-            canvas_w = int(canvas_h / ASPECT)
-        aspect = canvas_h / canvas_w
+            out_h = int(sh * 0.85)
+            out_w = int(out_h / ASPECT)
+        if frame_data:
+            FW, FH = frame_data["size"]
+            k = min(out_w / FW, out_h / FH)
+            fw, fh = int(FW * k), int(FH * k)
+            fx, fy = (out_w - fw) // 2, (out_h - fh) // 2
+            x0, y0, x1, y1 = frame_data["win"]
+            wx, wy = fx + int(x0 * k), fy + int(y0 * k)
+            ww, wh = int((x1 - x0) * k), int((y1 - y0) * k)
+            bg_col = frame_data["border"]   # 外框以外的空白補外框的顏色，看起來連成一片
+        else:
+            fh = out_h
+            fw = min(out_w, int(out_h / ASPECT))
+            fx, fy = (out_w - fw) // 2, 0
+            wx, wy, ww, wh = fx, fy, fw, fh
+            bg_col = (20, 16, 13)
+
+        img = np.empty((out_h, out_w, 3), np.uint8)
+        img[:] = bg_col
+        img[wy:wy + wh, wx:wx + ww] = BOARD
 
         cols = int(s["cols"])
-        bead = max(4, canvas_w // cols)
-        rows = int(round(cols * aspect))
-        codes, rgb, lut = palette(s["brand"])
+        bead = max(4, ww // cols)
+        rows = max(1, wh // bead)
+        codes, rgb = palette(s["brand"])
+        lut, ncolors = lut_for(s["brand"], s["filter"])
 
         if not ok or frame is None:
             # 攝影機還沒好（Mac 等使用者按「允許」、或之後才插上）：每 2 秒重試
@@ -306,11 +444,10 @@ def main():
                 last_retry = time.time()
                 cap.release()
                 cap = open_camera(s["camera"])
-            img = np.zeros((canvas_h, canvas_w, 3), np.uint8)
             hint = (["Mac：請在跳出的視窗按「允許」使用相機，", "或到「系統設定 → 隱私權與安全性 → 相機」打開拼豆鏡子"]
                     if IS_MAC else ["請確認攝影機已插上，", "並在「設定 → 隱私權 → 相機」允許桌面應用程式使用"])
-            img = put_text_cjk(img, ["找不到攝影機（會自動重試）"] + hint + ["按 C 切換攝影機、Q 離開"], (24, 40),
-                               scale=max(0.6, canvas_w / 1100))
+            img = put_text_cjk(img, ["找不到攝影機（會自動重試）"] + hint + ["按 C 切換攝影機、Q 離開"],
+                               (wx + 12, wy + 40), scale=max(0.5, ww / 1100))
         else:
             if s["mirror"] and not demo:
                 frame = cv2.flip(frame, 1)
@@ -329,39 +466,48 @@ def main():
             key = (s["brand"], bead)
             if sprites_key != key:
                 sprites, sprites_key = make_sprites(rgb, bead), key
-            tiles = sprites[idx]  # rows, cols, bead, bead, 3
-            mosaic = tiles.transpose(0, 2, 1, 3, 4).reshape(rows * bead, cols * bead, 3)
-            img = np.empty((canvas_h, canvas_w, 3), np.uint8)
-            img[:] = BOARD
-            oy = (canvas_h - mosaic.shape[0]) // 2
-            ox = (canvas_w - mosaic.shape[1]) // 2
-            mh, mw = min(mosaic.shape[0], canvas_h), min(mosaic.shape[1], canvas_w)
-            img[max(oy, 0):max(oy, 0) + mh, max(ox, 0):max(ox, 0) + mw] = mosaic[:mh, :mw]
+            mosaic = sprites[idx].transpose(0, 2, 1, 3, 4).reshape(rows * bead, cols * bead, 3)
+            # 窗格寬高不一定是豆子大小的整數倍，微幅縮放填滿窗格，避免邊緣留黑縫
+            if mosaic.shape[:2] != (wh, ww):
+                mosaic = cv2.resize(mosaic, (ww, wh), interpolation=cv2.INTER_LINEAR)
+            img[wy:wy + wh, wx:wx + ww] = mosaic
+
+        # 外框（含會動的角色）蓋在最上層
+        if frame_data:
+            t = (time.time() * 1000) % frame_data["total"]
+            fi = 0
+            for fi, d in enumerate(frame_data["durs"]):
+                if t < d:
+                    break
+                t -= d
+            fbgr, fmask = scaled_frames(frame_data, fw, fh)[fi]
+            region = img[fy:fy + fh, fx:fx + fw]
+            region[fmask] = fbgr[fmask]
+            # 濾鏡名稱標籤放在上方邊框中間
+            lh = max(18, int((wy - fy) * 0.45))
+            lab = label_image("濾鏡：" + fnames[s["filter"]] + ("" if s["auto"] else "（固定）"), lh, bg_col)
+            lx = fx + (fw - lab.shape[1]) // 2
+            ly = fy + (wy - fy - lh) // 2
+            if lab.shape[1] < fw and ly >= 0:
+                img[ly:ly + lh, lx:lx + lab.shape[1]] = lab
 
         if show_help or time.time() < help_until:
             img = put_text_cjk(img, [
-                f"{APP}　品牌：{BRANDS[s['brand']][0]}（{len(codes)} 色）　豆子：{cols} 顆寬",
+                f"{APP}　{BRANDS[s['brand']][0]}　濾鏡：{fnames[s['filter']]}（{ncolors} 色）　豆子 {cols} 顆寬",
                 "+ / -  豆子變多 / 變少      B  切換品牌",
-                "M  鏡像      R  旋轉      C  切換攝影機",
-                "F  全螢幕    L  自動補光   H  說明   Q  離開",
-            ], (20, 20), scale=max(0.6, canvas_w / 1100))
+                "N / P  下一個 / 上一個濾鏡   A  自動輪播 " + ("開" if s["auto"] else "關"),
+                "M  鏡像   R  旋轉   C  切換攝影機   L  補光",
+                "F  全螢幕    H  說明    Q  離開",
+            ], (20, 20), scale=max(0.6, min(out_w, out_h) / 1100))
 
-        # 旋轉並放到整個螢幕中間
         if rot:
             img = np.rot90(img, k=-rot).copy()
-        if s["fullscreen"]:
-            screen = np.zeros((sh, sw, 3), np.uint8)
-            screen[:] = (20, 16, 13)
-            h, w = img.shape[:2]
-            h, w = min(h, sh), min(w, sw)
-            y, x = (sh - h) // 2, (sw - w) // 2
-            screen[y:y + h, x:x + w] = img[:h, :w]
-            img = screen
         if snapshot:
             frames_done += 1
             if frames_done >= 20:
                 cv2.imwrite(snapshot, img)
-                print("snapshot saved", snapshot, img.shape, "beads", cols, "x", rows, "bead px", bead, "colors", len(codes))
+                print("snapshot saved", snapshot, img.shape, "filter", fnames[s["filter"]], "colors", ncolors,
+                      "beads", cols, "x", rows, "bead px", bead, "window", (ww, wh))
                 break
             help_until = 0 if "--nohelp" in sys.argv else help_until
             continue
@@ -378,6 +524,15 @@ def main():
             s["cols"] = max(COLS_MIN, cols - COLS_STEP)
         elif k in (ord("b"), ord("B")):
             s["brand"] = (s["brand"] + 1) % len(BRANDS)
+        elif k in (ord("n"), ord("N")):
+            s["filter"] = (s["filter"] + 1) % len(fnames)
+            last_switch = time.time()
+        elif k in (ord("p"), ord("P")):
+            s["filter"] = (s["filter"] - 1) % len(fnames)
+            last_switch = time.time()
+        elif k in (ord("a"), ord("A")):
+            s["auto"] = not s["auto"]
+            last_switch = time.time()
         elif k in (ord("m"), ord("M")):
             s["mirror"] = not s["mirror"]
         elif k in (ord("r"), ord("R")):

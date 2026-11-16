@@ -4,7 +4,7 @@
 
 a = Analysis(
     ["pindou_mirror.py"],
-    datas=[("palettes", "palettes")],
+    datas=[("palettes", "palettes"), ("assets", "assets")],
     excludes=["tkinter", "matplotlib"],
 )
 pyz = PYZ(a.pure)
@@ -29,3 +29,4 @@ app = BUNDLE(
         "LSApplicationCategoryType": "public.app-category.entertainment",
     },
 )
+

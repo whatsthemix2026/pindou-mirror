@@ -56,7 +56,7 @@ jobs:
       - name: 安裝套件
         run: pip install opencv-python numpy pillow pyinstaller
       - name: 打包 exe
-        run: pyinstaller --noconfirm --onefile --noconsole --name PindouMirror --add-data "palettes;palettes" --exclude-module tkinter --exclude-module matplotlib pindou_mirror.py
+        run: pyinstaller --noconfirm --onefile --noconsole --name PindouMirror --add-data "palettes;palettes" --add-data "assets;assets" --exclude-module tkinter --exclude-module matplotlib pindou_mirror.py
       - name: 冒煙測試
         shell: pwsh
         run: |
@@ -71,3 +71,4 @@ jobs:
             dist/PindouMirror.exe
             README.txt
             snap_win.png
+

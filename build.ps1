@@ -5,12 +5,15 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 $pal = (Resolve-Path palettes).Path
+$assets = (Resolve-Path assets).Path
 $lb = "C:\Users\User\anaconda3\Library\bin"
 & .\.venv\Scripts\python.exe -m PyInstaller `
   --noconfirm --clean --onefile --noconsole `
   --name "拼豆鏡子" `
   --add-data "$pal;palettes" `
+  --add-data "$assets;assets" `
   --add-binary "$lb\ffi-8.dll;." --add-binary "$lb\ffi-7.dll;." --add-binary "$lb\ffi.dll;." `
   --exclude-module tkinter --exclude-module matplotlib `
   pindou_mirror.py
 Copy-Item README.txt dist\ -Force
+
