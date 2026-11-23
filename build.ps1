@@ -13,7 +13,9 @@ $lb = "C:\Users\User\anaconda3\Library\bin"
   --add-data "$pal;palettes" `
   --add-data "$assets;assets" `
   --add-binary "$lb\ffi-8.dll;." --add-binary "$lb\ffi-7.dll;." --add-binary "$lb\ffi.dll;." `
-  --exclude-module tkinter --exclude-module matplotlib `
+  --add-binary "$lb\libexpat.dll;." --add-binary "$lb\expat.dll;." `
+  --collect-data mediapipe --collect-binaries mediapipe `
+  --exclude-module tkinter `
   pindou_mirror.py
 Copy-Item README.txt dist\ -Force
 

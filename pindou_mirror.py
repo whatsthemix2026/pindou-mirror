@@ -59,7 +59,15 @@ def app_dir():
 SETTINGS = os.path.join(app_dir(), "pindou_settings.json")
 DEFAULTS = {"cols": 40, "brand": 0, "mirror": True, "rotate": 0, "camera": 0, "fullscreen": True, "boost": True,
             "filter": 0, "auto": True}
-AUTO_SECONDS = 15
+AUTO_SECONDS = 30
+# 輪播的濾鏡（11/23 客戶：挑 3 個效果最好的，每 30 秒換）：一個寫實、一冷、一暖，換的時候差異明顯
+ROTATION = ["原色", "浪漫曇阿鵝", "沙漠好奇浣熊"]
+
+# 拍照：比 5（張開手掌）維持一下就開始倒數，倒數完拍照存檔
+PALM_HOLD = 0.7        # 手掌要維持幾秒才觸發，避免揮手誤觸
+COUNTDOWN = 5          # 倒數秒數
+RESULT_SECONDS = 30    # 拍完後顯示 QR code 的秒數
+PHOTO_DIR = "photos"   # 照片存在 app_dir() 底下
 
 def load_settings():
     s = dict(DEFAULTS)
@@ -201,6 +209,141 @@ def label_image(text, height, bg, fg=(255, 255, 255)):
         _label_cache[key] = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     return _label_cache[key]
 
+# ---------- 手勢：比 5（張開手掌） ----------
+
+class PalmDetector:
+    """用 MediaPipe 手部骨架判斷畫面中有沒有人「五指張開」。載入失敗時自動停用，不影響拼豆畫面。"""
+
+    TIPS, PIPS = (8, 12, 16, 20), (6, 10, 14, 18)
+
+    def __init__(self):
+        self.ok = False
+        try:
+            os.environ.setdefault("GLOG_minloglevel", "2")
+            import mediapipe as mp
+            from mediapipe.tasks.python import BaseOptions, vision
+            model = os.path.join(res_dir(), "assets", "hand_landmarker.task")
+            with open(model, "rb") as f:
+                opts = vision.HandLandmarkerOptions(
+                    base_options=BaseOptions(model_asset_buffer=f.read()),
+                    running_mode=vision.RunningMode.VIDEO, num_hands=2,
+                    min_hand_detection_confidence=0.6, min_tracking_confidence=0.5)
+            self.mp = mp
+            self.lm = vision.HandLandmarker.create_from_options(opts)
+            self.t0 = time.time()
+            self.last_ts = -1
+            self.ok = True
+        except Exception as e:  # 沒有 mediapipe 或模型檔：只是不能用手勢拍照
+            self.error = repr(e)
+
+    @staticmethod
+    def _d(a, b):
+        return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
+
+    def open_palm(self, frame_bgr):
+        """回傳 True：畫面中有一隻手五指都張開"""
+        if not self.ok:
+            return False
+        h, w = frame_bgr.shape[:2]
+        small = cv2.resize(frame_bgr, (640, int(640 * h / w)))
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        ts = int((time.time() - self.t0) * 1000)
+        if ts <= self.last_ts:
+            ts = self.last_ts + 1
+        self.last_ts = ts
+        res = self.lm.detect_for_video(self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb), ts)
+        for p in res.hand_landmarks:
+            wrist = p[0]
+            # 四指：指尖離手腕比第二指節遠很多＝伸直（跟手的方向無關）
+            fingers = sum(self._d(p[t], wrist) > self._d(p[j], wrist) * 1.25 for t, j in zip(self.TIPS, self.PIPS))
+            # 拇指：指尖離小指根部，比拇指根部離小指根部遠＝張開
+            thumb = self._d(p[4], p[17]) > self._d(p[2], p[17]) * 1.15
+            if fingers == 4 and thumb:
+                return True
+        return False
+
+
+def save_photo(img):
+    d = os.path.join(app_dir(), PHOTO_DIR)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, time.strftime("拼豆_%Y%m%d_%H%M%S.jpg"))
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if ok:
+        buf.tofile(path)  # tofile 才支援中文路徑
+    return path
+
+
+def text_image(lines, size, fg=(255, 255, 255), bg=(58, 36, 16), pad=None, radius=None):
+    """多行文字的小圖（BGR），預先畫好再貼，避免每一格重畫整個畫面。fg / bg 都是 BGR（預設深藍底白字）"""
+    from PIL import Image, ImageDraw, ImageFont
+    font_path = next((p for p in FONT_CANDIDATES if os.path.exists(p)), None)
+    font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+    pad = int(size * 0.45) if pad is None else pad
+    tmp = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    w = int(max(tmp.textlength(t, font=font) for t in lines)) + pad * 2
+    lh = int(size * 1.35)
+    h = lh * len(lines) + pad * 2
+    im = Image.new("RGB", (w, h), bg[::-1])
+    d = ImageDraw.Draw(im)
+    if radius:
+        im.paste(Image.new("RGB", (w, h), (0, 0, 0)))
+        d.rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=bg[::-1])
+    for i, t in enumerate(lines):
+        tw = tmp.textlength(t, font=font)
+        d.text(((w - tw) / 2, pad + i * lh), t, font=font, fill=fg[::-1])
+    return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+
+
+def paste(img, sub, x, y):
+    """把小圖貼到大圖上（自動裁掉超出範圍的部分）"""
+    h, w = sub.shape[:2]
+    H, W = img.shape[:2]
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    if x1 > x0 and y1 > y0:
+        img[y0:y1, x0:x1] = sub[y0 - y:y1 - y, x0 - x:x1 - x]
+
+
+_text_cache = {}
+
+def text_cache(key, fn):
+    if key not in _text_cache:
+        if len(_text_cache) > 64:
+            _text_cache.clear()
+        _text_cache[key] = fn()
+    return _text_cache[key]
+
+
+# 照片上傳網址：尚未設定（要等決定照片放哪裡、保留多久）。留空時拍照只存在本機 photos 資料夾。
+UPLOAD_URL = ""
+
+
+def start_upload(path, photo):
+    """背景上傳照片，成功後把下載網址做成 QR（不卡住畫面）"""
+    import threading
+
+    def work():
+        try:
+            url = upload_photo(path)
+            photo["qr"] = make_qr(url, 400)
+        except Exception as e:
+            photo["msg"] = "照片已存檔（上傳失敗）"
+            print("upload failed", e)
+    threading.Thread(target=work, daemon=True).start()
+
+
+def upload_photo(path):
+    raise NotImplementedError("尚未設定上傳位置")
+
+
+def make_qr(url, size):
+    import qrcode
+    q = qrcode.QRCode(border=2, box_size=10, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    q.add_data(url)
+    q.make(fit=True)
+    im = np.array(q.make_image(fill_color="black", back_color="white").convert("RGB"))
+    return cv2.resize(cv2.cvtColor(im, cv2.COLOR_RGB2BGR), (size, size), interpolation=cv2.INTER_NEAREST)
+
 # ---------- 豆子外觀 ----------
 
 BOARD = np.array([10, 10, 10], np.uint8)  # 豆子之間的空隙（模板底色），BGR；黑底
@@ -338,7 +481,22 @@ def main():
         s["filter"] = int(arg("--filter"))
     personas = load_personas()
     fnames = filter_names(personas)
+    rotation = [fnames.index(n) for n in ROTATION if n in fnames] or [0]
     s["filter"] = int(s["filter"]) % len(fnames)
+    if s["filter"] not in rotation and arg("--filter") is None:
+        s["filter"] = rotation[0]
+
+    def step_filter(d):
+        cur = rotation.index(s["filter"]) if s["filter"] in rotation else -1
+        s["filter"] = rotation[(cur + d) % len(rotation)]
+
+    palm = PalmDetector() if not (snapshot or demo) or "--gesture" in sys.argv else None
+    photo = {"phase": "idle", "palm_since": None, "t": 0.0, "path": None, "qr": None, "msg": None}
+    # 測試用：--photo-phase countdown|result 直接看倒數／QR 畫面
+    if arg("--photo-phase") == "countdown":
+        photo.update(phase="countdown", t=time.time() - 2.2)
+    elif arg("--photo-phase") == "result":
+        photo.update(phase="result", t=time.time(), qr=make_qr("https://example.com/pindou/photo-test", 400))
     frame_data = load_frame()
     palettes, luts = {}, {}
 
@@ -401,9 +559,18 @@ def main():
                 ok, frame = cap.read()
 
         # 濾鏡自動輪播
-        if s["auto"] and time.time() - last_switch >= AUTO_SECONDS:
-            s["filter"] = (s["filter"] + 1) % len(fnames)
+        if s["auto"] and time.time() - last_switch >= AUTO_SECONDS and photo["phase"] == "idle":
+            step_filter(1)
             last_switch = time.time()
+
+        # 比 5 偵測：閒置時，手掌張開維持 PALM_HOLD 秒就開始倒數
+        if palm and palm.ok and ok and frame is not None and photo["phase"] == "idle":
+            if palm.open_palm(frame):
+                photo["palm_since"] = photo["palm_since"] or time.time()
+                if time.time() - photo["palm_since"] >= PALM_HOLD:
+                    photo.update(phase="countdown", t=time.time(), palm_since=None)
+            else:
+                photo["palm_since"] = None
 
         # ---- 版面：輸出畫面 → 外框（9:16，等比放進畫面）→ 外框中間的窗格放拼豆 ----
         rot = s["rotate"] % 4
@@ -491,12 +658,51 @@ def main():
             if lab.shape[1] < fw and ly >= 0:
                 img[ly:ly + lh, lx:lx + lab.shape[1]] = lab
 
+        # ---- 拍照流程：倒數 → 拍下（存乾淨的畫面，不含提示文字）→ 閃光 → 左下角顯示 QR ----
+        now = time.time()
+        unit = max(12, int(fw * 0.045))                      # 文字大小跟著外框寬度
+        if photo["phase"] == "countdown" and now - photo["t"] >= COUNTDOWN:
+            path = save_photo(img)
+            photo.update(phase="flash", t=now, path=path, qr=None, msg="照片已存檔")
+            if UPLOAD_URL:
+                start_upload(path, photo)
+        if photo["phase"] == "flash" and now - photo["t"] >= 0.35:
+            photo.update(phase="result", t=now)
+        if photo["phase"] == "result" and now - photo["t"] >= RESULT_SECONDS:
+            photo.update(phase="idle", qr=None, msg=None)
+
+        if photo["phase"] == "countdown":
+            n = COUNTDOWN - int(now - photo["t"])
+            num = text_cache(("cd", n, unit), lambda: text_image([str(n)], unit * 5))
+            paste(img, num, wx + (ww - num.shape[1]) // 2, wy + (wh - num.shape[0]) // 2)
+            tip = text_cache(("cdtip", unit), lambda: text_image(["準備拍照！"], unit))
+            paste(img, tip, wx + (ww - tip.shape[1]) // 2, wy + (wh + num.shape[0]) // 2 + unit)
+        elif photo["phase"] == "flash":
+            img = cv2.addWeighted(img, 0.25, np.full_like(img, 255), 0.75, 0)
+        elif photo["phase"] == "result":
+            # 左下角：QR（上傳完成時）或狀態文字
+            qr_size = int(fw * 0.30)
+            qx, qy = fx + int(fw * 0.04), fy + fh - qr_size - int(fh * 0.025)
+            if photo["qr"] is not None:
+                cap_img = text_cache(("qrcap", unit), lambda: text_image(["掃描下載照片"], unit))
+                pad = max(6, qr_size // 20)
+                img[qy - pad:qy + qr_size + pad, qx - pad:qx + qr_size + pad] = 255
+                paste(img, cv2.resize(photo["qr"], (qr_size, qr_size), interpolation=cv2.INTER_NEAREST), qx, qy)
+                paste(img, cap_img, qx + (qr_size - cap_img.shape[1]) // 2, qy - pad - cap_img.shape[0] - 4)
+            else:
+                msg = text_cache(("msg", photo["msg"], unit), lambda: text_image([photo["msg"] or ""], unit))
+                paste(img, msg, qx, fy + fh - msg.shape[0] - int(fh * 0.03))
+        elif palm and palm.ok:
+            hint = text_cache(("hint", unit), lambda: text_image(["張開手掌比 5，倒數拍照"], int(unit * 0.8)))
+            paste(img, hint, fx + int(fw * 0.04), fy + fh - hint.shape[0] - int(fh * 0.03))
+
         if show_help or time.time() < help_until:
             img = put_text_cjk(img, [
                 f"{APP}　{BRANDS[s['brand']][0]}　濾鏡：{fnames[s['filter']]}（{ncolors} 色）　豆子 {cols} 顆寬",
                 "+ / -  豆子變多 / 變少      B  切換品牌",
                 "N / P  下一個 / 上一個濾鏡   A  自動輪播 " + ("開" if s["auto"] else "關"),
                 "M  鏡像   R  旋轉   C  切換攝影機   L  補光",
+                "空白鍵  倒數拍照（或對鏡頭張開手掌比 5）" + ("" if palm and palm.ok else "　※手勢辨識未啟用"),
                 "F  全螢幕    H  說明    Q  離開",
             ], (20, 20), scale=max(0.6, min(out_w, out_h) / 1100))
 
@@ -507,7 +713,8 @@ def main():
             if frames_done >= 20:
                 cv2.imwrite(snapshot, img)
                 print("snapshot saved", snapshot, img.shape, "filter", fnames[s["filter"]], "colors", ncolors,
-                      "beads", cols, "x", rows, "bead px", bead, "window", (ww, wh))
+                      "beads", cols, "x", rows, "bead px", bead, "window", (ww, wh),
+                      "gesture", (palm.ok if palm else "off"), getattr(palm, "error", ""))
                 break
             help_until = 0 if "--nohelp" in sys.argv else help_until
             continue
@@ -525,11 +732,15 @@ def main():
         elif k in (ord("b"), ord("B")):
             s["brand"] = (s["brand"] + 1) % len(BRANDS)
         elif k in (ord("n"), ord("N")):
-            s["filter"] = (s["filter"] + 1) % len(fnames)
+            step_filter(1)
             last_switch = time.time()
         elif k in (ord("p"), ord("P")):
-            s["filter"] = (s["filter"] - 1) % len(fnames)
+            step_filter(-1)
             last_switch = time.time()
+        elif k == ord(" "):                       # 空白鍵：工作人員手動開始倒數拍照
+            if photo["phase"] == "idle":
+                photo.update(phase="countdown", t=time.time(), palm_since=None)
+            continue
         elif k in (ord("a"), ord("A")):
             s["auto"] = not s["auto"]
             last_switch = time.time()

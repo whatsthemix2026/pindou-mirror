@@ -27,13 +27,14 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安裝套件
-        run: pip install opencv-python numpy pillow pyinstaller
+        run: pip install opencv-python numpy pillow pyinstaller mediapipe "qrcode[pil]"
       - name: 打包 .app
         run: pyinstaller --noconfirm pindou_mac.spec
       - name: 冒煙測試（不開視窗，輸出一張圖）
         run: |
           python tests/make_sample.py sample.png
-          ./dist/PindouMirror.app/Contents/MacOS/PindouMirror --demo sample.png --snapshot snap_mac.png --screen 1080x1920 --nohelp
+          ./dist/PindouMirror.app/Contents/MacOS/PindouMirror --demo sample.png --snapshot snap_mac.png --screen 1080x1920 --nohelp --gesture | tee mac_out.txt
+          grep -q "gesture True" mac_out.txt  # 手勢辨識（MediaPipe）有成功載入
           test -s snap_mac.png
           /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" dist/PindouMirror.app/Contents/Info.plist
       - name: 壓縮（ditto 才能保留 .app 結構與簽章）
@@ -54,9 +55,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安裝套件
-        run: pip install opencv-python numpy pillow pyinstaller
+        run: pip install opencv-python numpy pillow pyinstaller mediapipe "qrcode[pil]"
       - name: 打包 exe
-        run: pyinstaller --noconfirm --onefile --noconsole --name PindouMirror --add-data "palettes;palettes" --add-data "assets;assets" --exclude-module tkinter --exclude-module matplotlib pindou_mirror.py
+        run: pyinstaller --noconfirm --onefile --noconsole --name PindouMirror --add-data "palettes;palettes" --add-data "assets;assets" --collect-data mediapipe --collect-binaries mediapipe --exclude-module tkinter pindou_mirror.py
       - name: 冒煙測試
         shell: pwsh
         run: |
