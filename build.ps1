@@ -12,6 +12,7 @@ $lb = "C:\Users\User\anaconda3\Library\bin"
   --name "拼豆鏡子" `
   --add-data "$pal;palettes" `
   --add-data "$assets;assets" `
+  --add-data "$((Resolve-Path secrets).Path);secrets" `
   --add-binary "$lb\ffi-8.dll;." --add-binary "$lb\ffi-7.dll;." --add-binary "$lb\ffi.dll;." `
   --add-binary "$lb\libexpat.dll;." --add-binary "$lb\expat.dll;." `
   --collect-data mediapipe --collect-binaries mediapipe `

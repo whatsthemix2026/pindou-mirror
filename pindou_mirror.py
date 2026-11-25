@@ -66,7 +66,8 @@ ROTATION = ["原色", "浪漫曇阿鵝", "沙漠好奇浣熊"]
 # 拍照：比 5（張開手掌）維持一下就開始倒數，倒數完拍照存檔
 PALM_HOLD = 0.7        # 手掌要維持幾秒才觸發，避免揮手誤觸
 COUNTDOWN = 5          # 倒數秒數
-RESULT_SECONDS = 30    # 拍完後顯示 QR code 的秒數
+RESULT_SECONDS = 30    # QR code（或失敗訊息）出現後顯示的秒數
+UPLOAD_WAIT = 45       # 上傳最多等這麼久，超過就回到待機（照片仍在本機）
 PHOTO_DIR = "photos"   # 照片存在 app_dir() 底下
 
 def load_settings():
@@ -314,26 +315,83 @@ def text_cache(key, fn):
     return _text_cache[key]
 
 
-# 照片上傳網址：尚未設定（要等決定照片放哪裡、保留多久）。留空時拍照只存在本機 photos 資料夾。
-UPLOAD_URL = ""
+def load_upload_config():
+    """照片上傳設定 {url, key}：先找 app_dir() 的 photo_upload.json（現場可覆寫），再找打包進去的 secrets/。
+    密語不放在公開程式碼，也不放進 GitHub 打包（公開 repo 的打包結果任何人都能下載）：
+    Windows 本機打包讀 secrets/photo_upload.json（不進 git）；Mac 版把 photo_upload.json 放到 app_dir()。"""
+    for p in (os.path.join(app_dir(), "photo_upload.json"), os.path.join(res_dir(), "secrets", "photo_upload.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                c = json.load(f)
+            if c.get("url") and c.get("key"):
+                return c
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+UPLOAD = load_upload_config()
+UPLOAD_URL = UPLOAD["url"] if UPLOAD else ""
 
 
 def start_upload(path, photo):
-    """背景上傳照片，成功後把下載網址做成 QR（不卡住畫面）"""
+    """背景上傳照片，成功後把下載網址做成 QR（不卡住畫面）。
+    每張照片一個 job：上傳很慢、已經換下一個人拍照時，舊照片的 QR 不能出現在新的畫面上。"""
     import threading
+    job = object()
+    photo.update(msg="照片上傳中…", job=job, pending=True)
 
     def work():
         try:
-            url = upload_photo(path)
-            photo["qr"] = make_qr(url, 400)
+            done = {"qr": make_qr(upload_photo(path), 400)}
+            remove_photo(path)                              # 已在雲端，現場電腦不留；上傳失敗的才留著
         except Exception as e:
-            photo["msg"] = "照片已存檔（上傳失敗）"
-            print("upload failed", e)
+            done = {"msg": "照片已存檔（上傳失敗）"}
+            log_error("上傳失敗：" + repr(e))
+        if photo.get("job") is job:
+            photo.update(done, pending=False, t=time.time())   # 從 QR 出現開始算顯示時間
     threading.Thread(target=work, daemon=True).start()
 
 
+def remove_photo(path):
+    try:
+        os.remove(path)
+    except OSError as e:
+        log_error("刪除本機照片失敗：" + repr(e))
+
+
 def upload_photo(path):
-    raise NotImplementedError("尚未設定上傳位置")
+    """傳到統計後台（Google Apps Script），回傳照片的下載網址。Google 偶爾回錯誤頁，最多試 3 次。"""
+    import base64
+    import urllib.request
+    with open(path, "rb") as f:
+        data = f.read()
+    body = json.dumps({"photo": base64.b64encode(data).decode("ascii"), "key": UPLOAD["key"],
+                       "name": os.path.basename(path)}).encode("utf-8")
+    last = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(UPLOAD["url"], data=body, method="POST",
+                                         headers={"Content-Type": "text/plain;charset=utf-8"})
+            with urllib.request.urlopen(req, timeout=60) as res:   # Apps Script 會轉址，urllib 自動跟隨
+                r = json.loads(res.read().decode("utf-8"))
+            if r.get("ok"):
+                return r["url"]
+            last = r.get("error")
+            if last == "forbidden":
+                break                                               # 密語錯，重試也沒用
+        except Exception as e:
+            last = repr(e)
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"upload failed: {last}")
+
+
+def log_error(msg):
+    try:
+        with open(os.path.join(app_dir(), "pindou_error.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
 
 
 def make_qr(url, size):
@@ -491,7 +549,8 @@ def main():
         s["filter"] = rotation[(cur + d) % len(rotation)]
 
     palm = PalmDetector() if not (snapshot or demo) or "--gesture" in sys.argv else None
-    photo = {"phase": "idle", "palm_since": None, "t": 0.0, "path": None, "qr": None, "msg": None}
+    photo = {"phase": "idle", "palm_since": None, "t": 0.0, "path": None, "qr": None, "msg": None,
+             "job": None, "pending": False}
     # 測試用：--photo-phase countdown|result 直接看倒數／QR 畫面
     if arg("--photo-phase") == "countdown":
         photo.update(phase="countdown", t=time.time() - 2.2)
@@ -668,8 +727,8 @@ def main():
                 start_upload(path, photo)
         if photo["phase"] == "flash" and now - photo["t"] >= 0.35:
             photo.update(phase="result", t=now)
-        if photo["phase"] == "result" and now - photo["t"] >= RESULT_SECONDS:
-            photo.update(phase="idle", qr=None, msg=None)
+        if photo["phase"] == "result" and now - photo["t"] >= (UPLOAD_WAIT if photo["pending"] else RESULT_SECONDS):
+            photo.update(phase="idle", qr=None, msg=None, job=None, pending=False)
 
         if photo["phase"] == "countdown":
             n = COUNTDOWN - int(now - photo["t"])
@@ -684,7 +743,7 @@ def main():
             qr_size = int(fw * 0.30)
             qx, qy = fx + int(fw * 0.04), fy + fh - qr_size - int(fh * 0.025)
             if photo["qr"] is not None:
-                cap_img = text_cache(("qrcap", unit), lambda: text_image(["掃描下載照片"], unit))
+                cap_img = text_cache(("qrcap", unit), lambda: text_image(["掃描下載照片", "（7 天內有效）"], int(unit * 0.85)))
                 pad = max(6, qr_size // 20)
                 img[qy - pad:qy + qr_size + pad, qx - pad:qx + qr_size + pad] = 255
                 paste(img, cv2.resize(photo["qr"], (qr_size, qr_size), interpolation=cv2.INTER_NEAREST), qx, qy)
