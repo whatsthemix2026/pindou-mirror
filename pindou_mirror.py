@@ -315,11 +315,31 @@ def text_cache(key, fn):
     return _text_cache[key]
 
 
+def bundle_dir():
+    """Mac：PindouMirror.app 所在的資料夾（.app/Contents/MacOS/執行檔 往上四層）；其他平台回傳 None"""
+    if IS_MAC and getattr(sys, "frozen", False):
+        exe = os.path.abspath(sys.executable)
+        app = os.path.dirname(os.path.dirname(os.path.dirname(exe)))
+        if app.endswith(".app"):
+            return os.path.dirname(app)
+    return None
+
+
+# Mac 從下載位置直接打開沒搬過的 app，系統會把它放到隨機的唯讀位置執行（App Translocation），旁邊的檔案就讀不到
+TRANSLOCATED = IS_MAC and "/AppTranslocation/" in os.path.abspath(sys.executable)
+
+
 def load_upload_config():
-    """照片上傳設定 {url, key}：先找 app_dir() 的 photo_upload.json（現場可覆寫），再找打包進去的 secrets/。
-    密語不放在公開程式碼，也不放進 GitHub 打包（公開 repo 的打包結果任何人都能下載）：
-    Windows 本機打包讀 secrets/photo_upload.json（不進 git）；Mac 版把 photo_upload.json 放到 app_dir()。"""
-    for p in (os.path.join(app_dir(), "photo_upload.json"), os.path.join(res_dir(), "secrets", "photo_upload.json")):
+    """照片上傳設定 {url, key}，依序找：
+    1. app_dir() 的 photo_upload.json（Windows＝exe 旁邊；Mac＝~/Library/Application Support/拼豆鏡子）
+    2. Mac：PindouMirror.app 旁邊的 photo_upload.json
+    3. 打包進去的 secrets/（只有 Windows 本機打包有）
+    密語不放在公開程式碼，也不放進 GitHub 打包（公開 repo 的打包結果任何人都能下載）。"""
+    paths = [os.path.join(app_dir(), "photo_upload.json")]
+    if bundle_dir():
+        paths.append(os.path.join(bundle_dir(), "photo_upload.json"))
+    paths.append(os.path.join(res_dir(), "secrets", "photo_upload.json"))
+    for p in paths:
         try:
             with open(p, encoding="utf-8") as f:
                 c = json.load(f)
@@ -725,6 +745,10 @@ def main():
             photo.update(phase="flash", t=now, path=path, qr=None, msg="照片已存檔")
             if UPLOAD_URL:
                 start_upload(path, photo)
+            elif TRANSLOCATED:
+                photo["msg"] = "照片已存檔|沒有 QR：請把 app 搬到別的資料夾再開"
+            else:
+                photo["msg"] = "照片已存檔|沒有 QR：找不到 photo_upload.json"
         if photo["phase"] == "flash" and now - photo["t"] >= 0.35:
             photo.update(phase="result", t=now)
         if photo["phase"] == "result" and now - photo["t"] >= (UPLOAD_WAIT if photo["pending"] else RESULT_SECONDS):
@@ -749,7 +773,7 @@ def main():
                 paste(img, cv2.resize(photo["qr"], (qr_size, qr_size), interpolation=cv2.INTER_NEAREST), qx, qy)
                 paste(img, cap_img, qx + (qr_size - cap_img.shape[1]) // 2, qy - pad - cap_img.shape[0] - 4)
             else:
-                msg = text_cache(("msg", photo["msg"], unit), lambda: text_image([photo["msg"] or ""], unit))
+                msg = text_cache(("msg", photo["msg"], unit), lambda: text_image((photo["msg"] or "").split("|"), int(unit * 0.8)))  # | 分行
                 paste(img, msg, qx, fy + fh - msg.shape[0] - int(fh * 0.03))
         elif palm and palm.ok:
             hint = text_cache(("hint", unit), lambda: text_image(["張開手掌比 5，倒數拍照"], int(unit * 0.8)))
@@ -773,7 +797,8 @@ def main():
                 cv2.imwrite(snapshot, img)
                 print("snapshot saved", snapshot, img.shape, "filter", fnames[s["filter"]], "colors", ncolors,
                       "beads", cols, "x", rows, "bead px", bead, "window", (ww, wh),
-                      "gesture", (palm.ok if palm else "off"), getattr(palm, "error", ""))
+                      "gesture", (palm.ok if palm else "off"), getattr(palm, "error", ""),
+                      "upload", bool(UPLOAD_URL))
                 break
             help_until = 0 if "--nohelp" in sys.argv else help_until
             continue

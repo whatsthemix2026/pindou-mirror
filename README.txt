@@ -44,8 +44,13 @@
   現場電腦：上傳成功的照片會立刻刪掉；上傳失敗（例如斷網）的留在 photos 資料夾，展覽結束後請手動刪除。
     Windows＝exe 旁邊的 photos；Mac＝~/Library/Application Support/拼豆鏡子/photos
   觀眾要求刪除照片：到專案帳號雲端硬碟的「拼豆照片」資料夾，依時間找到照片刪除並清空垃圾桶。
-  Mac 版要自己放上傳設定：把開發人員給的 photo_upload.json 放到 ~/Library/Application Support/拼豆鏡子/
-    （沒放的話照片只存在電腦裡，不會出現 QR code）。這個檔案等於密碼，不要公開或上傳到網路。
+  Mac 版要自己放上傳設定：把開發人員給的 photo_upload.json 放在 PindouMirror.app 旁邊（同一個資料夾），
+    或放到 ~/Library/Application Support/拼豆鏡子/，放好後重開程式。
+    沒放的話照片只存在電腦裡，拍完會顯示「沒有 QR：找不到 photo_upload.json」。
+    這個檔案等於密碼，不要公開或上傳到網路。
+  Mac 注意：解壓縮後請先把 PindouMirror.app 和 photo_upload.json 一起搬到別的資料夾（例如桌面上的新資料夾）
+    再打開。直接在「下載項目」裡打開，系統會把 app 放到別處執行，讀不到旁邊的 photo_upload.json，
+    畫面會顯示「請把 app 搬到別的資料夾再開」。
   手勢辨識需要畫面中看得到整隻手，光線太暗時可能偵測不到，可以改按空白鍵。
 
 【螢幕】
