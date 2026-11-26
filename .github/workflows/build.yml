@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安裝套件
-        run: pip install opencv-python numpy pillow pyinstaller mediapipe "qrcode[pil]"
+        run: pip install opencv-python numpy pillow pyinstaller mediapipe "qrcode[pil]" certifi
       - name: 打包 .app
         run: pyinstaller --noconfirm pindou_mac.spec
       - name: 冒煙測試（不開視窗，輸出一張圖）
@@ -37,6 +37,10 @@ jobs:
           grep -q "gesture True" mac_out.txt  # 手勢辨識（MediaPipe）有成功載入
           test -s snap_mac.png
           /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" dist/PindouMirror.app/Contents/Info.plist
+      - name: 連線測試（打包版能用 HTTPS 連到照片上傳網址；用錯的密語，應回 False）
+        run: |
+          ./dist/PindouMirror.app/Contents/MacOS/PindouMirror --checknet | tee net_mac.txt
+          grep -q "checknet False" net_mac.txt
       - name: 壓縮（ditto 才能保留 .app 結構與簽章）
         run: ditto -c -k --keepParent dist/PindouMirror.app PindouMirror-mac-${{ matrix.arch }}.zip
       - uses: actions/upload-artifact@v4
@@ -55,9 +59,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安裝套件
-        run: pip install opencv-python numpy pillow pyinstaller mediapipe "qrcode[pil]"
+        run: pip install opencv-python numpy pillow pyinstaller mediapipe "qrcode[pil]" certifi
       - name: 打包 exe
-        run: pyinstaller --noconfirm --onefile --noconsole --name PindouMirror --add-data "palettes;palettes" --add-data "assets;assets" --collect-data mediapipe --collect-binaries mediapipe --exclude-module tkinter pindou_mirror.py
+        run: pyinstaller --noconfirm --onefile --noconsole --name PindouMirror --add-data "palettes;palettes" --add-data "assets;assets" --collect-data mediapipe --collect-binaries mediapipe --collect-data certifi --hidden-import certifi --exclude-module tkinter pindou_mirror.py
       - name: 冒煙測試
         shell: pwsh
         run: |

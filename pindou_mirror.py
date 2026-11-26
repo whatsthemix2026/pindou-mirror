@@ -296,14 +296,38 @@ def text_image(lines, size, fg=(255, 255, 255), bg=(58, 36, 16), pad=None, radiu
     return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
 
 
+def outline_text(lines, size, fg=(255, 255, 255), stroke=(58, 36, 16)):
+    """透明底的外框字（BGRA），直接疊在畫面上、沒有底色方塊。fg / stroke 是 BGR"""
+    from PIL import Image, ImageDraw, ImageFont
+    font_path = next((p for p in FONT_CANDIDATES if os.path.exists(p)), None)
+    font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+    sw = max(4, size // 12)
+    tmp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    w = int(max(tmp.textlength(t, font=font) for t in lines)) + sw * 4
+    lh = int(size * 1.25)
+    h = lh * len(lines) + sw * 4
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    for i, t in enumerate(lines):
+        tw = tmp.textlength(t, font=font)
+        d.text(((w - tw) / 2, sw * 2 + i * lh), t, font=font, fill=fg[::-1] + (255,),
+               stroke_width=sw, stroke_fill=stroke[::-1] + (255,))
+    return cv2.cvtColor(np.array(im), cv2.COLOR_RGBA2BGRA)
+
+
 def paste(img, sub, x, y):
-    """把小圖貼到大圖上（自動裁掉超出範圍的部分）"""
+    """把小圖貼到大圖上（自動裁掉超出範圍的部分）；sub 有透明通道（BGRA）時按透明度疊上去"""
     h, w = sub.shape[:2]
     H, W = img.shape[:2]
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(W, x + w), min(H, y + h)
     if x1 > x0 and y1 > y0:
-        img[y0:y1, x0:x1] = sub[y0 - y:y1 - y, x0 - x:x1 - x]
+        part = sub[y0 - y:y1 - y, x0 - x:x1 - x]
+        if part.shape[2] == 4:
+            a = part[:, :, 3:4].astype(np.float32) / 255
+            img[y0:y1, x0:x1] = (part[:, :, :3] * a + img[y0:y1, x0:x1] * (1 - a)).astype(np.uint8)
+        else:
+            img[y0:y1, x0:x1] = part
 
 
 _text_cache = {}
@@ -380,6 +404,28 @@ def ask_text(prompt):
     return None
 
 
+def ssl_context():
+    """HTTPS 用的憑證。Mac 打包版的 Python 讀不到系統憑證，不指定會 CERTIFICATE_VERIFY_FAILED"""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def upload_error_text(e):
+    """上傳失敗時畫面上顯示的簡短原因"""
+    s = str(e)
+    if "forbidden" in s:
+        return "密語錯誤，請按 U 重新輸入"
+    if "CERTIFICATE" in s or "SSL" in s:
+        return "安全連線失敗"
+    if "timed out" in s or "URLError" in s or "getaddrinfo" in s or "Errno" in s:
+        return "連不上網路"
+    return "上傳失敗"
+
+
 def check_key(url, key):
     """送一小段不是 JPG 的資料測試密語（photo 不能是空字串，否則會被當成測驗作答）：
     密語錯回 forbidden；密語對回 not jpg，雲端不會多出檔案。
@@ -388,7 +434,7 @@ def check_key(url, key):
     try:
         req = urllib.request.Request(url, data=json.dumps({"photo": "eA==", "key": key}).encode("utf-8"),
                                      method="POST", headers={"Content-Type": "text/plain;charset=utf-8"})
-        with urllib.request.urlopen(req, timeout=30) as res:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as res:
             r = json.loads(res.read().decode("utf-8"))
         return {"not jpg": True, "forbidden": False}.get(r.get("error"))
     except Exception as e:
@@ -435,7 +481,7 @@ def start_upload(path, photo):
             done = {"qr": make_qr(upload_photo(path), 400)}
             remove_photo(path)                              # 已在雲端，現場電腦不留；上傳失敗的才留著
         except Exception as e:
-            done = {"msg": "照片已存檔（上傳失敗）"}
+            done = {"msg": "照片已存檔（上傳失敗）|" + upload_error_text(e)}
             log_error("上傳失敗：" + repr(e))
         if photo.get("job") is job:
             photo.update(done, pending=False, t=time.time())   # 從 QR 出現開始算顯示時間
@@ -462,7 +508,7 @@ def upload_photo(path):
         try:
             req = urllib.request.Request(UPLOAD["url"], data=body, method="POST",
                                          headers={"Content-Type": "text/plain;charset=utf-8"})
-            with urllib.request.urlopen(req, timeout=60) as res:   # Apps Script 會轉址，urllib 自動跟隨
+            with urllib.request.urlopen(req, timeout=60, context=ssl_context()) as res:   # Apps Script 會轉址，urllib 自動跟隨
                 r = json.loads(res.read().decode("utf-8"))
             if r.get("ok"):
                 return r["url"]
@@ -619,6 +665,10 @@ def main():
     demo = arg("--demo")
     snapshot = arg("--snapshot")      # 測試用：不開視窗，跑幾格後把畫面存成圖片
     screen_arg = arg("--screen")      # 測試用：假裝螢幕尺寸，例如 1080x1920
+
+    if "--checknet" in sys.argv:
+        print("checknet", check_key(DEFAULT_UPLOAD_URL, "ci-wrong-key"), flush=True)
+        return
 
     s = load_settings()
     if snapshot:
@@ -825,9 +875,9 @@ def main():
 
         if photo["phase"] == "countdown":
             n = COUNTDOWN - int(now - photo["t"])
-            num = text_cache(("cd", n, unit), lambda: text_image([str(n)], unit * 5))
+            num = text_cache(("cd", n, unit), lambda: outline_text([str(n)], unit * 6))
             paste(img, num, wx + (ww - num.shape[1]) // 2, wy + (wh - num.shape[0]) // 2)
-            tip = text_cache(("cdtip", unit), lambda: text_image(["準備拍照！"], unit))
+            tip = text_cache(("cdtip", unit), lambda: outline_text(["準備拍照！"], int(unit * 1.2)))
             paste(img, tip, wx + (ww - tip.shape[1]) // 2, wy + (wh + num.shape[0]) // 2 + unit)
         elif photo["phase"] == "flash":
             img = cv2.addWeighted(img, 0.25, np.full_like(img, 255), 0.75, 0)

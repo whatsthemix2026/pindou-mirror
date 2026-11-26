@@ -5,7 +5,8 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 a = Analysis(
     ["pindou_mirror.py"],
-    datas=[("palettes", "palettes"), ("assets", "assets")] + collect_data_files("mediapipe"),
+    datas=[("palettes", "palettes"), ("assets", "assets")] + collect_data_files("mediapipe") + collect_data_files("certifi"),
+    hiddenimports=["certifi"],   # HTTPS 憑證，沒有的話 Mac 上傳照片會失敗
     binaries=collect_dynamic_libs("mediapipe"),
     excludes=["tkinter"],
 )

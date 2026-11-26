@@ -16,6 +16,7 @@ $lb = "C:\Users\User\anaconda3\Library\bin"
   --add-binary "$lb\ffi-8.dll;." --add-binary "$lb\ffi-7.dll;." --add-binary "$lb\ffi.dll;." `
   --add-binary "$lb\libexpat.dll;." --add-binary "$lb\expat.dll;." `
   --collect-data mediapipe --collect-binaries mediapipe `
+  --collect-data certifi --hidden-import certifi `
   --exclude-module tkinter `
   pindou_mirror.py
 Copy-Item README.txt dist\ -Force
