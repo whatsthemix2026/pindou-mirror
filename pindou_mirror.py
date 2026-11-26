@@ -12,6 +12,7 @@
   N / P     下一個 / 上一個濾鏡
   A         濾鏡自動輪播開關（預設每 15 秒換一個）
   H         顯示 / 隱藏操作說明
+  U         輸入照片上傳密語（拍完沒有 QR code 時用）
 
 濾鏡：原色、黑白、粉彩、霓虹、五種人格色。每個濾鏡都只用真實拼豆色號中的一組，
 畫面永遠是「真的拼得出來」的拼豆圖。人格色取自五隻像素角色 GIF 的主要顏色。
@@ -325,10 +326,6 @@ def bundle_dir():
     return None
 
 
-# Mac 從下載位置直接打開沒搬過的 app，系統會把它放到隨機的唯讀位置執行（App Translocation），旁邊的檔案就讀不到
-TRANSLOCATED = IS_MAC and "/AppTranslocation/" in os.path.abspath(sys.executable)
-
-
 def load_upload_config():
     """照片上傳設定 {url, key}，依序找：
     1. app_dir() 的 photo_upload.json（Windows＝exe 旁邊；Mac＝~/Library/Application Support/拼豆鏡子）
@@ -352,6 +349,78 @@ def load_upload_config():
 
 UPLOAD = load_upload_config()
 UPLOAD_URL = UPLOAD["url"] if UPLOAD else ""
+# 「拼豆照片」部署的網址可以公開：沒有密語就上傳不了。密語只由工作人員第一次開程式時貼上，不放進程式碼。
+DEFAULT_UPLOAD_URL = ("https://script.google.com/macros/s/AKfycbzvYzvP9blWK7hkWLqUnzsWLXdghzemQu8N9DjtbHr3sGUoozez4"
+                      "SEH3ohaA60leK4IOg/exec")
+
+
+def ask_text(prompt):
+    """跳出輸入框讓工作人員貼上文字；按略過／取消回傳 None"""
+    import subprocess
+    try:
+        if IS_MAC:
+            lines = ["on run argv", "activate",
+                     'set r to display dialog (item 1 of argv) default answer "" with title (item 2 of argv) '
+                     'buttons {"略過", "確定"} default button "確定" cancel button "略過"',
+                     "return text returned of r", "end run"]
+            cmd = ["osascript"]
+            for line in lines:
+                cmd += ["-e", line]
+            p = subprocess.run(cmd + [prompt, APP], capture_output=True, text=True, timeout=900)
+            return p.stdout.strip() or None if p.returncode == 0 else None
+        if IS_WIN:
+            ps = ("Add-Type -AssemblyName Microsoft.VisualBasic; "
+                  "[Microsoft.VisualBasic.Interaction]::InputBox($env:PINDOU_PROMPT, $env:PINDOU_TITLE, '')")
+            p = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                               timeout=900, env=dict(os.environ, PINDOU_PROMPT=prompt, PINDOU_TITLE=APP),
+                               creationflags=0x08000000)               # 不跳出黑色主控台視窗
+            return p.stdout.strip() or None
+    except Exception as e:
+        log_error("輸入框失敗：" + repr(e))
+    return None
+
+
+def check_key(url, key):
+    """送一小段不是 JPG 的資料測試密語（photo 不能是空字串，否則會被當成測驗作答）：
+    密語錯回 forbidden；密語對回 not jpg，雲端不會多出檔案。
+    回傳 True／False；連不上網路或回應看不懂回傳 None。"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, data=json.dumps({"photo": "eA==", "key": key}).encode("utf-8"),
+                                     method="POST", headers={"Content-Type": "text/plain;charset=utf-8"})
+        with urllib.request.urlopen(req, timeout=30) as res:
+            r = json.loads(res.read().decode("utf-8"))
+        return {"not jpg": True, "forbidden": False}.get(r.get("error"))
+    except Exception as e:
+        log_error("檢查密語失敗：" + repr(e))
+        return None
+
+
+def setup_upload():
+    """請工作人員貼上照片上傳密語，確認正確後存到 app_dir()/photo_upload.json，之後不用再輸入"""
+    global UPLOAD, UPLOAD_URL
+    msg = ("請貼上照片上傳密語（開發人員私下提供）。\n\n"
+           "按「略過」也能使用，但拍完不會出現 QR code；之後可以按 U 鍵重新輸入。")
+    while True:
+        key = ask_text(msg)
+        if not key:
+            return False
+        key = key.strip()
+        ok = check_key(DEFAULT_UPLOAD_URL, key)
+        if ok is False:
+            msg = "密語錯誤，請再貼一次（不要多複製到空白或其他文字）。\n\n按「略過」可以先跳過。"
+            continue
+        cfg = {"url": DEFAULT_UPLOAD_URL, "key": key}
+        try:
+            with open(os.path.join(app_dir(), "photo_upload.json"), "w", encoding="utf-8") as f:
+                json.dump(cfg, f)
+        except OSError as e:
+            log_error("儲存上傳設定失敗：" + repr(e))
+        UPLOAD, UPLOAD_URL = cfg, cfg["url"]
+        if ok is None:
+            show_error_dialog("目前連不上網路，無法確認密語是否正確，先存起來。\n"
+                              "拍照後如果沒有出現 QR code，請檢查網路，或按 U 重新輸入密語。")
+        return True
 
 
 def start_upload(path, photo):
@@ -558,6 +627,8 @@ def main():
     if arg("--filter") is not None:
         s["filter"] = int(arg("--filter"))
     personas = load_personas()
+    if not (snapshot or demo) and not UPLOAD:
+        setup_upload()                # 第一次開：請工作人員貼上照片上傳密語
     fnames = filter_names(personas)
     rotation = [fnames.index(n) for n in ROTATION if n in fnames] or [0]
     s["filter"] = int(s["filter"]) % len(fnames)
@@ -745,10 +816,8 @@ def main():
             photo.update(phase="flash", t=now, path=path, qr=None, msg="照片已存檔")
             if UPLOAD_URL:
                 start_upload(path, photo)
-            elif TRANSLOCATED:
-                photo["msg"] = "照片已存檔|沒有 QR：請把 app 搬到別的資料夾再開"
             else:
-                photo["msg"] = "照片已存檔|沒有 QR：找不到 photo_upload.json"
+                photo["msg"] = "照片已存檔|沒有 QR：請按 U 輸入上傳密語"
         if photo["phase"] == "flash" and now - photo["t"] >= 0.35:
             photo.update(phase="result", t=now)
         if photo["phase"] == "result" and now - photo["t"] >= (UPLOAD_WAIT if photo["pending"] else RESULT_SECONDS):
@@ -786,7 +855,7 @@ def main():
                 "N / P  下一個 / 上一個濾鏡   A  自動輪播 " + ("開" if s["auto"] else "關"),
                 "M  鏡像   R  旋轉   C  切換攝影機   L  補光",
                 "空白鍵  倒數拍照（或對鏡頭張開手掌比 5）" + ("" if palm and palm.ok else "　※手勢辨識未啟用"),
-                "F  全螢幕    H  說明    Q  離開",
+                "F  全螢幕    H  說明    U  上傳密語    Q  離開",
             ], (20, 20), scale=max(0.6, min(out_w, out_h) / 1100))
 
         if rot:
@@ -838,6 +907,11 @@ def main():
             show_help = not show_help
         elif k in (ord("f"), ord("F")):
             s["fullscreen"] = not s["fullscreen"]
+            apply_window()
+        elif k in (ord("u"), ord("U")) and not snapshot:
+            if s["fullscreen"]:                       # 先離開全螢幕，輸入框才不會被蓋住
+                cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+            setup_upload()
             apply_window()
         elif k in (ord("c"), ord("C")) and not demo:
             cap.release()
