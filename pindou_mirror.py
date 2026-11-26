@@ -10,7 +10,7 @@
   F         全螢幕開關
   L         自動補光開關（展場偏暗時讓顏色不灰）
   N / P     下一個 / 上一個濾鏡
-  A         濾鏡自動輪播開關（預設每 15 秒換一個）
+  A         濾鏡自動輪播開關（預設關，固定原色）
   H         顯示 / 隱藏操作說明
   U         輸入照片上傳密語（拍完沒有 QR code 時用）
 
@@ -59,10 +59,19 @@ def app_dir():
 
 SETTINGS = os.path.join(app_dir(), "pindou_settings.json")
 DEFAULTS = {"cols": 40, "brand": 0, "mirror": True, "rotate": 0, "camera": 0, "fullscreen": True, "boost": True,
-            "filter": 0, "auto": True}
+            "filter": 0, "auto": False}
 AUTO_SECONDS = 30
-# 輪播的濾鏡（11/23 客戶：挑 3 個效果最好的，每 30 秒換）：一個寫實、一冷、一暖，換的時候差異明顯
+# 可切換的濾鏡（N / P）。11/26 客戶：不再自動輪播，每次開啟固定用第一個（原色）
 ROTATION = ["原色", "浪漫曇阿鵝", "沙漠好奇浣熊"]
+FILTER_LABEL_SECONDS = 3   # 工作人員按 N / P / A 後，上方顯示濾鏡名稱幾秒
+
+# 背景：測驗網站的封面天空（11/26 客戶：取代粉紅外框和阿鵝），雲和海左右慢慢飄，跟網站封面一樣
+BG_FILE = os.path.join("assets", "cover_bg.png")
+BG_SPLIT = 0.608           # 圖片上方 60.8% 是天空、下面是海（同網站 .cover-sky / .cover-sea）
+BG_ZOOM, BG_DRIFT = 1.06, 0.022     # 放大 6%，左右各飄 2.2%
+BG_PERIOD = (16.0, 12.0)            # 天空、海飄一趟的秒數（海反方向）
+# 拼豆窗格在 9:16 版面中的位置（沿用原本外框的窗格比例）
+WIN_RECT = (0.16875, 0.09507, 0.834375, 0.913732)
 
 # 拍照：比 5（張開手掌）維持一下就開始倒數，倒數完拍照存檔
 PALM_HOLD = 0.7        # 手掌要維持幾秒才觸發，避免揮手誤觸
@@ -154,43 +163,41 @@ def filter_subset(rgb, fi, personas):
     sub = np.unique(sub)
     return sub if len(sub) >= 2 else np.arange(len(rgb))
 
-# ---------- 外框 ----------
+# ---------- 背景（網站封面的天空與海） ----------
 
-FRAME_FILE = os.path.join("assets", "frame.gif")
-
-def load_frame():
-    """外框 GIF：自動找出中間透明窗格的位置，之後換別張外框也不用改程式"""
-    p = os.path.join(res_dir(), FRAME_FILE)
+def load_background():
+    p = os.path.join(res_dir(), BG_FILE)
     if not os.path.exists(p):
         return None
-    from PIL import Image, ImageSequence
-    im = Image.open(p)
-    frames, durs = [], []
-    for f in ImageSequence.Iterator(im):
-        a = np.array(f.convert("RGBA"))
-        frames.append(a[..., [2, 1, 0, 3]].copy())  # RGBA → BGRA
-        durs.append(f.info.get("duration") or 100)
-    al = frames[0][..., 3]
-    H, W = al.shape
-    ys = np.where(al[:, W // 2] < 10)[0]
-    xs = np.where(al[H // 3, :] < 10)[0]
-    win = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1) if len(xs) and len(ys) else (0, 0, W, H)
-    border = tuple(int(v) for v in frames[0][min(20, H - 1), min(20, W - 1), :3])
-    return {"frames": frames, "durs": durs, "total": sum(durs), "win": win, "size": (W, H), "border": border}
+    from PIL import Image
+    return np.array(Image.open(p).convert("RGB"))[..., ::-1].copy()   # BGR
 
-_frame_cache = {}
 
-def scaled_frames(fr, fw, fh):
-    """外框縮放後的 (BGR, 不透明遮罩) 清單；像素圖用最近鄰縮放保持銳利"""
-    key = (fw, fh)
-    if key not in _frame_cache:
-        _frame_cache.clear()
-        out = []
-        for f in fr["frames"]:
-            r = cv2.resize(f, (fw, fh), interpolation=cv2.INTER_NEAREST)
-            out.append((r[..., :3].copy(), r[..., 3] > 127))
-        _frame_cache[key] = out
-    return _frame_cache[key]
+_bg_cache = {}
+
+def draw_background(img, bg, t):
+    """把封面背景鋪滿整個畫面（等比放大裁切），天空和海各自左右飄"""
+    H, W = img.shape[:2]
+    key = (W, H)
+    if key not in _bg_cache:
+        _bg_cache.clear()
+        bh, bw = bg.shape[:2]
+        k = max(W / bw, H / bh) * BG_ZOOM
+        big = cv2.resize(bg, (int(bw * k) + 2, int(bh * k) + 2), interpolation=cv2.INTER_NEAREST)
+        _bg_cache[key] = big
+    big = _bg_cache[key]
+    BH, BW = big.shape[:2]
+    ox, oy = (BW - W) // 2, (BH - H) // 2
+    split = min(H, max(0, int(BH * BG_SPLIT) - oy))
+    import math
+    for (y0, y1), period, sign in (((0, split), BG_PERIOD[0], 1), ((split, H), BG_PERIOD[1], -1)):
+        if y1 <= y0:
+            continue
+        e = (1 - math.cos(math.pi * ((t / period) % 2))) / 2       # 0→1→0，像 CSS ease-in-out alternate
+        dx = int(round(sign * (e * 2 - 1) * BG_DRIFT * W))
+        x = max(0, min(BW - W, ox + dx))
+        img[y0:y1] = big[oy + y0:oy + y1, x:x + W]
+
 
 _label_cache = {}
 
@@ -682,8 +689,9 @@ def main():
     fnames = filter_names(personas)
     rotation = [fnames.index(n) for n in ROTATION if n in fnames] or [0]
     s["filter"] = int(s["filter"]) % len(fnames)
-    if s["filter"] not in rotation and arg("--filter") is None:
-        s["filter"] = rotation[0]
+    if arg("--filter") is None:
+        s["filter"] = rotation[0]          # 每次開啟都從原色開始（不沿用上次關掉時的濾鏡）
+    s["auto"] = False                      # 不自動輪播；工作人員仍可按 A 暫時打開
 
     def step_filter(d):
         cur = rotation.index(s["filter"]) if s["filter"] in rotation else -1
@@ -697,7 +705,8 @@ def main():
         photo.update(phase="countdown", t=time.time() - 2.2)
     elif arg("--photo-phase") == "result":
         photo.update(phase="result", t=time.time(), qr=make_qr("https://example.com/pindou/photo-test", 400))
-    frame_data = load_frame()
+    background = load_background()
+    label_until = 0.0
     palettes, luts = {}, {}
 
     def palette(i):
@@ -779,24 +788,20 @@ def main():
         else:
             out_h = int(sh * 0.85)
             out_w = int(out_h / ASPECT)
-        if frame_data:
-            FW, FH = frame_data["size"]
-            k = min(out_w / FW, out_h / FH)
-            fw, fh = int(FW * k), int(FH * k)
-            fx, fy = (out_w - fw) // 2, (out_h - fh) // 2
-            x0, y0, x1, y1 = frame_data["win"]
-            wx, wy = fx + int(x0 * k), fy + int(y0 * k)
-            ww, wh = int((x1 - x0) * k), int((y1 - y0) * k)
-            bg_col = frame_data["border"]   # 外框以外的空白補外框的顏色，看起來連成一片
-        else:
-            fh = out_h
-            fw = min(out_w, int(out_h / ASPECT))
-            fx, fy = (out_w - fw) // 2, 0
-            wx, wy, ww, wh = fx, fy, fw, fh
-            bg_col = (20, 16, 13)
+        k = min(out_w, out_h / ASPECT)
+        fw, fh = int(k), int(k * ASPECT)                  # 9:16 版面（文字、QR 的大小以它為準）
+        fx, fy = (out_w - fw) // 2, (out_h - fh) // 2
+        wx, wy = fx + int(WIN_RECT[0] * fw), fy + int(WIN_RECT[1] * fh)
+        ww, wh = int((WIN_RECT[2] - WIN_RECT[0]) * fw), int((WIN_RECT[3] - WIN_RECT[1]) * fh)
+        bg_col = (58, 36, 16)                              # 標籤底色（深藍）
 
         img = np.empty((out_h, out_w, 3), np.uint8)
-        img[:] = bg_col
+        if background is not None:
+            draw_background(img, background, time.time())
+        else:
+            img[:] = (235, 206, 160)
+        bw_ = max(3, fw // 160)                            # 拼豆窗格的白色邊
+        img[wy - bw_:wy + wh + bw_, wx - bw_:wx + ww + bw_] = 255
         img[wy:wy + wh, wx:wx + ww] = BOARD
 
         cols = int(s["cols"])
@@ -839,18 +844,8 @@ def main():
                 mosaic = cv2.resize(mosaic, (ww, wh), interpolation=cv2.INTER_LINEAR)
             img[wy:wy + wh, wx:wx + ww] = mosaic
 
-        # 外框（含會動的角色）蓋在最上層
-        if frame_data:
-            t = (time.time() * 1000) % frame_data["total"]
-            fi = 0
-            for fi, d in enumerate(frame_data["durs"]):
-                if t < d:
-                    break
-                t -= d
-            fbgr, fmask = scaled_frames(frame_data, fw, fh)[fi]
-            region = img[fy:fy + fh, fx:fx + fw]
-            region[fmask] = fbgr[fmask]
-            # 濾鏡名稱標籤放在上方邊框中間
+        # 濾鏡名稱：只在工作人員切換濾鏡後顯示幾秒（或自動輪播打開時一直顯示）
+        if s["auto"] or time.time() < label_until:
             lh = max(18, int((wy - fy) * 0.45))
             lab = label_image("濾鏡：" + fnames[s["filter"]] + ("" if s["auto"] else "（固定）"), lh, bg_col)
             lx = fx + (fw - lab.shape[1]) // 2
@@ -936,17 +931,20 @@ def main():
             s["brand"] = (s["brand"] + 1) % len(BRANDS)
         elif k in (ord("n"), ord("N")):
             step_filter(1)
-            last_switch = time.time()
+            last_switch = label_until = time.time()
+            label_until += FILTER_LABEL_SECONDS
         elif k in (ord("p"), ord("P")):
             step_filter(-1)
-            last_switch = time.time()
+            last_switch = label_until = time.time()
+            label_until += FILTER_LABEL_SECONDS
         elif k == ord(" "):                       # 空白鍵：工作人員手動開始倒數拍照
             if photo["phase"] == "idle":
                 photo.update(phase="countdown", t=time.time(), palm_since=None)
             continue
         elif k in (ord("a"), ord("A")):
             s["auto"] = not s["auto"]
-            last_switch = time.time()
+            last_switch = label_until = time.time()
+            label_until += FILTER_LABEL_SECONDS
         elif k in (ord("m"), ord("M")):
             s["mirror"] = not s["mirror"]
         elif k in (ord("r"), ord("R")):
